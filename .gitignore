@@ -1,0 +1,37 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environments
+venv/
+env/
+.venv/
+ENV/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# Environment Variables & Secrets
+.env
+.env.local
+*.key
+
+# Local datasets and generated analytics
+# The supplied files are synthetic, but contain realistic KYC, PAN, Aadhaar,
+# transaction, settlement, and complaint records. Keep them local and out of Git.
+/DATA/
+/data/
+/cleaned_data/
+/processed/
+
+# OS Generated
+.DS_Store
+Thumbs.db
+
+# Scratch / Temporary
+*.tmp
+*.log
