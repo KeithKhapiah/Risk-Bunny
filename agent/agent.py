@@ -1,5 +1,5 @@
 """
-AI Risk Agent module powered by DuckDB (or built-in SQLite fallback) and Google Gemini.
+AI Risk Agent module powered by DuckDB with optional Google Gemini.
 Translates Natural Language business questions into SQL, executes them,
 renders styled Plotly charts, and provides executive takeaways.
 """
@@ -7,8 +7,11 @@ renders styled Plotly charts, and provides executive takeaways.
 import os
 import re
 import json
-import sqlite3
-import pandas as pd
+from functools import lru_cache
+
+import duckdb
+
+from risk_data import find_data_files, load_tables
 try:
     import plotly.express as px
     import plotly.graph_objects as go
@@ -19,14 +22,6 @@ except ImportError:
     HAS_PLOTLY = False
 from pathlib import Path
 from dotenv import load_dotenv
-
-# Try importing duckdb; if not installed, fallback to sqlite3 smoothly
-try:
-    import duckdb
-    HAS_DUCKDB = True
-except ImportError:
-    duckdb = None
-    HAS_DUCKDB = False
 
 def load_app_env():
     here = Path(__file__).resolve().parent
@@ -47,119 +42,35 @@ def load_app_env():
 
 load_app_env()
 
-def get_cleaned_data_dir():
-    here = Path(__file__).resolve().parent
-    repo_root = here.parent
-    candidates = [
-        repo_root / "data" / "processed",
-        here / "data" / "processed",
-        repo_root / "data",
-        here / "data",
-        repo_root / "DATA" / "cleaned_data",
-        here / "DATA" / "cleaned_data",
-        repo_root / "cleaned_data",
-        here / "cleaned_data",
-        Path("data/processed").resolve(),
-        Path("data").resolve(),
-        Path("DATA/cleaned_data").resolve(),
-        Path("cleaned_data").resolve(),
-    ]
-    for c in candidates:
-        if c.exists() and ((c / "fact_transactions.csv").exists() or (c / "fact_transactions.parquet").exists() or (c / "dim_customers.csv").exists()):
-            return c
-    return candidates[0]
+@lru_cache(maxsize=4)
+def load_database(file_versions):
+    files = {name: path for name, path, _mtime in file_versions}
+    connection = duckdb.connect(":memory:", config={
+        "allow_unsigned_extensions": "false", "threads": "2",
+    })
+    for name, frame in load_tables(files).items():
+        connection.register("incoming_table", frame)
+        connection.execute(f"CREATE TABLE {name} AS SELECT * FROM incoming_table")
+        connection.unregister("incoming_table")
+    connection.execute("SET enable_external_access = false")
+    return connection
 
-class QueryResult:
-    """Wrapper to ensure .df() works across DuckDB and SQLite."""
-    def __init__(self, df):
-        self._df = df
-
-    def df(self):
-        return self._df
-
-class SQLiteEngine:
-    """SQLite fallback engine when DuckDB is not installed."""
-    def __init__(self, conn):
-        self.conn = conn
-
-    def execute(self, sql):
-        clean_sql = sql.strip()
-        # Convert any DuckDB-specific dialect if present
-        clean_sql = clean_sql.replace("STRFTIME(CAST(txn_timestamp AS DATE), '%Y-%m-%d')", "SUBSTR(txn_timestamp, 1, 10)")
-        clean_sql = clean_sql.replace("CAST(txn_timestamp AS VARCHAR)", "txn_timestamp")
-        df = pd.read_sql_query(clean_sql, self.conn)
-        return QueryResult(df)
-
-class DuckDBEngine:
-    """DuckDB engine wrapper."""
-    def __init__(self, con):
-        self.con = con
-
-    def execute(self, sql):
-        return self.con.execute(sql)
-
-_DB_ENGINE = None
 
 def get_duckdb_connection():
-    """Initializes in-memory database and registers cleaned tables."""
-    global _DB_ENGINE
-    if _DB_ENGINE is not None:
-        return _DB_ENGINE
+    return load_database(tuple(
+        (name, path, path.stat().st_mtime_ns) for name, path in find_data_files().items()
+    ))
 
-    base_dir = get_cleaned_data_dir()
 
-    if HAS_DUCKDB:
-        con = duckdb.connect(database=':memory:')
-        
-        # Load fact_transactions
-        if (base_dir / "fact_transactions.parquet").exists():
-            con.execute(f"CREATE TABLE fact_transactions AS SELECT * FROM read_parquet('{(base_dir / 'fact_transactions.parquet').as_posix()}')")
-        elif (base_dir / "fact_transactions.csv").exists():
-            con.execute(f"CREATE TABLE fact_transactions AS SELECT * FROM read_csv_auto('{(base_dir / 'fact_transactions.csv').as_posix()}')")
+def run_analytics_query(connection, sql):
+    statements = connection.extract_statements(sql)
+    if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
+        raise ValueError("Only one read-only SELECT query is allowed.")
+    # A cursor has independent result state when multiple Streamlit sessions query concurrently.
+    return connection.cursor().execute(
+        f"SELECT * FROM ({statements[0].query.strip().removesuffix(';')}) AS result LIMIT 500"
+    ).df()
 
-        # Load fact_chargebacks
-        if (base_dir / "fact_chargebacks.parquet").exists():
-            con.execute(f"CREATE TABLE fact_chargebacks AS SELECT * FROM read_parquet('{(base_dir / 'fact_chargebacks.parquet').as_posix()}')")
-        elif (base_dir / "fact_chargebacks.csv").exists():
-            con.execute(f"CREATE TABLE fact_chargebacks AS SELECT * FROM read_csv_auto('{(base_dir / 'fact_chargebacks.csv').as_posix()}')")
-
-        # Load dim_merchants
-        if (base_dir / "dim_merchants.parquet").exists():
-            con.execute(f"CREATE TABLE dim_merchants AS SELECT * FROM read_parquet('{(base_dir / 'dim_merchants.parquet').as_posix()}')")
-        elif (base_dir / "dim_merchants.csv").exists():
-            con.execute(f"CREATE TABLE dim_merchants AS SELECT * FROM read_csv_auto('{(base_dir / 'dim_merchants.csv').as_posix()}')")
-
-        # Load dim_customers
-        if (base_dir / "dim_customers.parquet").exists():
-            con.execute(f"CREATE TABLE dim_customers AS SELECT * FROM read_parquet('{(base_dir / 'dim_customers.parquet').as_posix()}')")
-        elif (base_dir / "dim_customers.csv").exists():
-            con.execute(f"CREATE TABLE dim_customers AS SELECT * FROM read_csv_auto('{(base_dir / 'dim_customers.csv').as_posix()}')")
-
-        _DB_ENGINE = DuckDBEngine(con)
-    else:
-        # Fallback to in-memory SQLite
-        conn = sqlite3.connect(':memory:', check_same_thread=False)
-        
-        # Load CSVs into SQLite
-        if (base_dir / "fact_transactions.csv").exists():
-            df_txn = pd.read_csv(base_dir / "fact_transactions.csv")
-            df_txn.to_sql("fact_transactions", conn, if_exists="replace", index=False)
-
-        if (base_dir / "fact_chargebacks.csv").exists():
-            df_cbk = pd.read_csv(base_dir / "fact_chargebacks.csv")
-            df_cbk.to_sql("fact_chargebacks", conn, if_exists="replace", index=False)
-
-        if (base_dir / "dim_merchants.csv").exists():
-            df_merch = pd.read_csv(base_dir / "dim_merchants.csv")
-            df_merch.to_sql("dim_merchants", conn, if_exists="replace", index=False)
-
-        if (base_dir / "dim_customers.csv").exists():
-            df_cust = pd.read_csv(base_dir / "dim_customers.csv")
-            df_cust.to_sql("dim_customers", conn, if_exists="replace", index=False)
-
-        _DB_ENGINE = SQLiteEngine(conn)
-
-    return _DB_ENGINE
 
 SYSTEM_PROMPT = """You are an elite FinTech Data Analyst Agent for a National Payments Authority.
 Your task is to answer business questions about UPI transactions, merchant risk, and fraud chargebacks.
@@ -208,7 +119,7 @@ Guidelines:
   "y_axis": "",
   "chart_title": "Risk Bunny Assistant",
   "executive_summary": "Direct, helpful answer including formatted code blocks if requested."
-- Keep any SQL DuckDB / SQLite compatible. Always use COALESCE and LIMIT where appropriate.
+- Use DuckDB SQL. Always use COALESCE and LIMIT where appropriate.
 """
 
 def fallback_semantic_query(question: str):
@@ -284,10 +195,10 @@ print("Primes up to 50:", find_primes_up_to(50))
             "x_axis": "",
             "y_axis": "",
             "chart_title": "Risk Bunny AI Copilot",
-            "executive_summary": "👋 Hi! I am **Risk Bunny**, your UPI fraud intelligence copilot. I can query 20,400+ transactions, 4,300+ merchants, and 2,800+ chargebacks in DuckDB.\n\nTry asking:\n- *Which merchant categories have the highest chargebacks?*\n- *Show daily transaction volume and failure spikes.*\n- *What is the correlation between missing UTR and transaction status?*\n- *Who are the top 10 serial disputers by disputed value?*"
+            "executive_summary": "👋 Hi! I am **Risk Bunny**, your UPI fraud intelligence copilot. I can query the transactions, merchants, and chargebacks loaded into DuckDB.\n\nTry asking:\n- *Which merchant categories have the highest chargebacks?*\n- *Show daily transaction volume and failure spikes.*\n- *What is the correlation between missing UTR and transaction status?*\n- *Who are the top 10 serial disputers by disputed value?*"
         }
 
-    elif any(k in q for k in ["category", "mcc"]) and any(k in q for k in ["chargeback", "dispute", "highest"]):
+    elif any(k in q for k in ["category", "categories", "mcc"]) and any(k in q for k in ["chargeback", "dispute", "highest"]):
         return {
             "sql_query": """
                 SELECT 
@@ -311,12 +222,12 @@ print("Primes up to 50:", find_primes_up_to(50))
         return {
             "sql_query": """
                 SELECT 
-                    SUBSTR(txn_timestamp, 1, 10) AS txn_date,
+                    CAST(txn_timestamp AS DATE) AS txn_date,
                     COUNT(txn_id) AS total_transactions,
                     ROUND(SUM(amount), 2) AS total_volume,
                     SUM(CASE WHEN status_clean = 'FAILED' THEN 1 ELSE 0 END) AS failed_count
                 FROM fact_transactions
-                WHERE txn_timestamp IS NOT NULL AND txn_timestamp != ''
+                WHERE txn_timestamp IS NOT NULL
                 GROUP BY txn_date
                 ORDER BY txn_date ASC
             """,
@@ -337,7 +248,7 @@ print("Primes up to 50:", find_primes_up_to(50))
                     COALESCE(dm.merchant_status_clean, 'ACTIVE') AS status
                 FROM fact_chargebacks fc
                 LEFT JOIN dim_merchants dm ON fc.merchant_id = dm.merchant_id
-                GROUP BY merchant_name, status
+                GROUP BY 1, 4
                 ORDER BY dispute_count DESC
                 LIMIT 10
             """,
@@ -358,7 +269,7 @@ print("Primes up to 50:", find_primes_up_to(50))
                     COALESCE(dc.risk_segment_clean, 'UNKNOWN') AS risk_segment
                 FROM fact_chargebacks fc
                 LEFT JOIN dim_customers dc ON fc.user_id = dc.user_id
-                GROUP BY customer_name, risk_segment
+                GROUP BY 1, 4
                 ORDER BY total_disputed_value DESC
                 LIMIT 10
             """,
@@ -500,8 +411,7 @@ print("Primes up to 50:", find_primes_up_to(50))
 
 def query_agent(question: str):
     """
-    Core agent invocation. Tries Gemini via google.generativeai / langchain,
-    and falls back smoothly to semantic matcher if unavailable.
+    Try Gemini when configured, otherwise use the built-in offline queries.
     """
     engine = get_duckdb_connection()
     api_key = os.getenv("GEMINI_API_KEY")
@@ -511,11 +421,14 @@ def query_agent(question: str):
     # 1. Try Gemini if API key is present
     if api_key and api_key.strip():
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel("gemini-1.5-flash")
+            from google import genai
+
             prompt = f"{SYSTEM_PROMPT}\n\nQuestion: {question}\n\nRespond ONLY with valid JSON."
-            response = model.generate_content(prompt)
+            with genai.Client(api_key=api_key) as client:
+                response = client.models.generate_content(
+                    model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+                    contents=prompt,
+                )
             raw_text = response.text.strip()
             if raw_text.startswith("```"):
                 raw_text = re.sub(r"^```[a-zA-Z]*\n", "", raw_text)
@@ -525,15 +438,19 @@ def query_agent(question: str):
             spec = None
 
     # 2. If Gemini didn't return or was offline, use smart semantic fallback
-    if spec is None:
+    if not isinstance(spec, dict):
         spec = fallback_semantic_query(question)
 
-    sql_query = spec.get("sql_query", "").strip() if spec.get("sql_query") else ""
+    sql = spec.get("sql_query")
+    sql_query = sql.strip() if isinstance(sql, str) else ""
     chart_type = spec.get("chart_type", "none")
     x_axis = spec.get("x_axis", "")
     y_axis = spec.get("y_axis", "")
     chart_title = spec.get("chart_title", "Risk Bunny Assistant")
     executive_summary = spec.get("executive_summary", "Summary of results.")
+
+    if sql_query:
+        executive_summary = "The chart and table show the results of the query for the loaded dataset."
 
     # 3. If no SQL query is needed (e.g. general questions, coding help, greetings)
     if not sql_query:
@@ -546,9 +463,9 @@ def query_agent(question: str):
             "df": None,
         }
 
-    # Execute SQL in Database Engine (DuckDB or SQLite)
+    # Execute SQL against the loaded tables.
     try:
-        df = engine.execute(sql_query).df()
+        df = run_analytics_query(engine, sql_query)
     except Exception as err:
         return {
             "error": f"SQL Execution Error: {err}",
