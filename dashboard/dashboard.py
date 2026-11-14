@@ -1,6 +1,6 @@
 """UPI Fraud Ring & Merchant Analytics dashboard.
 
-Run with: streamlit run dashboard.py
+Run from the repository root: python -m streamlit run dashboard/app.py
 """
 
 from pathlib import Path
@@ -15,41 +15,10 @@ import streamlit as st
 
 st.set_page_config(page_title="UPI Fraud Analytics", page_icon="◆", layout="wide")
 
-def find_data_dir():
-    here = Path(__file__).resolve().parent
-    repo_root = here.parent
-    candidates = [
-        repo_root / "data" / "processed",
-        here / "data" / "processed",
-        repo_root / "data",
-        here / "data",
-        repo_root / "DATA" / "cleaned_data",
-        here / "DATA" / "cleaned_data",
-        repo_root / "cleaned_data",
-        here / "cleaned_data",
-        Path("data/processed").resolve(),
-        Path("data").resolve(),
-        Path("DATA/cleaned_data").resolve(),
-        Path("cleaned_data").resolve(),
-    ]
-    for c in candidates:
-        if (c / "dim_customers.csv").exists() or (c / "fact_transactions.csv").exists():
-            return c
-    return repo_root / "data" / "processed"
+from agent.agent import query_agent
+from risk_data import find_data_files, load_tables, quality_report
 
-DATA_DIR = find_data_dir()
-
-try:
-    from agent.agent import query_agent
-except ImportError:
-    try:
-        from agent import query_agent
-    except ImportError:
-        import sys
-        here = Path(__file__).resolve().parent
-        repo_root = here.parent
-        sys.path.extend([str(here), str(repo_root), str(repo_root / "agent")])
-        from agent import query_agent
+DATA_FILES = find_data_files()
 
 def get_bunny_assets():
     here = Path(__file__).resolve().parent
@@ -92,33 +61,12 @@ COLORS = [
 
 
 @st.cache_data(show_spinner="Loading dashboard data...")
-def load_data():
-    customers = pd.read_csv(DATA_DIR / "dim_customers.csv")
-    merchants = pd.read_csv(DATA_DIR / "dim_merchants.csv")
-    transactions = pd.read_csv(DATA_DIR / "fact_transactions.csv")
-    chargebacks = pd.read_csv(DATA_DIR / "fact_chargebacks.csv")
-
-    date_columns = [
-        (customers, ["date_of_birth_clean", "signup_timestamp_clean"]),
-        (merchants, ["onboarding_date_clean"]),
-        (transactions, ["txn_timestamp"]),
-        (chargebacks, [
-            "transaction_timestamp_clean",
-            "reported_timestamp_clean",
-            "bank_response_timestamp_clean",
-        ]),
-    ]
-    for frame, columns in date_columns:
-        for column in columns:
-            frame[column] = pd.to_datetime(frame[column], errors="coerce")
-
-    transactions["merchant_category_final"] = transactions[
-        "merchant_category_final"
-    ].fillna("Unclassified")
-    chargebacks["merchant_category_final"] = chargebacks[
-        "merchant_category_final"
-    ].fillna("Unclassified")
-    return customers, merchants, transactions, chargebacks
+def load_data(files, modified_times):
+    tables = load_tables(files)
+    for name in ("fact_transactions", "fact_chargebacks"):
+        frame = tables[name]
+        frame["merchant_category_final"] = frame["merchant_category_final"].fillna("Unclassified")
+    return tables, quality_report(tables)
 
 
 def money(value: float) -> str:
@@ -454,7 +402,20 @@ if not st.session_state.get("boot_complete", False):
     st.stop()
 
 
-customers, merchants, transactions, chargebacks = load_data()
+try:
+    tables, data_quality = load_data(
+        DATA_FILES, tuple(path.stat().st_mtime_ns for path in DATA_FILES.values())
+    )
+except (KeyError, OSError, ValueError) as error:
+    st.error(f"Could not load the analytics tables. Check the schema in DATA_DICTIONARY.md. {error}")
+    st.stop()
+
+merchants = tables["dim_merchants"]
+transactions = tables["fact_transactions"].dropna(subset=["txn_timestamp"])
+chargebacks = tables["fact_chargebacks"]
+if transactions.empty:
+    st.warning("The dataset contains no transactions with a valid timestamp.")
+    st.stop()
 
 FILTER_DEFAULTS = {
     "start_date_filter": transactions["txn_timestamp"].min().date(),
@@ -752,6 +713,10 @@ with col_head_bunny:
 with st.sidebar:
     st.markdown("### Command filters")
     st.caption("Refine every view in the dashboard")
+    if not DATA_FILES:
+        st.info("Synthetic demo. Generated from a fixed seed using fictional records.")
+    with st.expander("Data quality checks"):
+        st.write(data_quality)
     st.markdown("<div class='quick-label'>QUICK EXPLORE</div>", unsafe_allow_html=True)
     quick_left, quick_right = st.columns(2)
     with quick_left:
